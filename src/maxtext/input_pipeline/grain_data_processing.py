@@ -14,24 +14,27 @@
 
 """Input pipeline using Grain."""
 
-import glob
-from pathlib import Path
-import functools
-import ml_collections
-from concurrent import futures
-import json
+from __future__ import annotations
 
-import jax
+import functools
+import glob
+import json
+from concurrent import futures
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Sequence
+
+import ml_collections
+
+if TYPE_CHECKING:
+  import transformers
 
 import grain.python as grain
+import jax
 from grain.experimental import ElasticIterator
 
-from maxtext.input_pipeline import data_processing_utils
-from maxtext.input_pipeline import input_pipeline_utils
-from maxtext.input_pipeline import grain_tokenizer
-from maxtext.input_pipeline import multihost_dataloading
-from maxtext.utils import gcs_utils
-from maxtext.utils import max_logging
+from maxtext.input_pipeline import data_processing_utils, grain_tokenizer, input_pipeline_utils, multihost_dataloading
+from maxtext.input_pipeline import tokenizer as tokenizer_module
+from maxtext.utils import gcs_utils, max_logging
 
 
 def find_data_files(data_file_pattern):
@@ -281,9 +284,8 @@ def dpo_preprocessing_pipeline(
   return dataset
 
 
-def _format_chat_template_grain(element, data_columns, tokenizer_model):
-  """Grain-compatible mapping function to format raw columns into conversational messages."""
-  # Convert raw columns to conversational messages
+def _standardize_messages_sft(element, data_columns):
+  """Standardizes conversational/SFT message formatting into a standard 'messages' structure."""
   if "messages" in data_columns:
     messages = element["messages"]
   elif set(data_columns) == {"prompt", "completion"}:
@@ -298,67 +300,94 @@ def _format_chat_template_grain(element, data_columns, tokenizer_model):
       hasattr(m, "__contains__") and "role" in m and "content" in m for m in messages
   ), f"SFT requires a conversational format. Expected dicts with 'role' and 'content', but got: {messages}"
 
-  # Assign the standardized messages back to the primary column
   element[data_columns[0]] = messages
-
-  return input_pipeline_utils.apply_chat_template(
-      element, tokenizer_model=tokenizer_model, data_column_name=data_columns[0]
-  )
-
-
-def _tokenize_sft_chunks(element, text_column_name, tokenizer_model):
-  """Tokenize each chunk individually without truncating."""
-  text_chunks = element[text_column_name]
-  element[text_column_name] = [tokenizer_model.encode(chunk) for chunk in text_chunks]
   return element
 
 
+def _format_and_mask_sft(
+    element: dict[str, Any],
+    data_columns: Sequence[str],
+    tokenizer_model: transformers.PreTrainedTokenizerBase,
+    sentinel_ids: tuple[int, int],
+    max_target_length: int,
+    pad_id: int,
+    chat_template: str | None = None,
+    sft_train_last_turn_only: bool = False,
+    sft_train_on_thoughts_only: bool = False,
+) -> dict[str, Any]:
+  """Standardizes messages and applies SFT masking in a single Grain map step."""
+  element = _standardize_messages_sft(element, data_columns)
+  return input_pipeline_utils.apply_chat_template(
+      example=element,
+      tokenizer_model=tokenizer_model,
+      data_column_name=data_columns[0],
+      sentinel_ids=sentinel_ids,
+      max_target_length=max_target_length,
+      unk_id=pad_id,
+      chat_template=chat_template,
+      sft_train_last_turn_only=sft_train_last_turn_only,
+      sft_train_on_thoughts_only=sft_train_on_thoughts_only,
+  )
+
+
 def sft_preprocessing_pipeline(
-    dataset,
-    config,
-    data_columns,
-    tokenize,
-    grain_worker_count,
-    grain_per_worker_buffer_size,
-):
+    dataset: Any,
+    config: ml_collections.ConfigDict,
+    data_columns: Sequence[str],
+    tokenize: bool,
+    grain_worker_count: int,
+    grain_per_worker_buffer_size: int,
+) -> Any:
   """Use grain pipeline to pre-process the dataset and return iterators for sft fine-tuning"""
   dataset = data_processing_utils.parse_and_keep_features(dataset, config, data_columns, tokenize)
 
   tokenizer_model, pad_id = data_processing_utils.get_tokenizer_and_pad_id(config)
-  base_tokenizer_model = tokenizer_model
 
-  tokenizer_model = getattr(tokenizer_model, "tokenizer", tokenizer_model)
+  if not isinstance(tokenizer_model, tokenizer_module.HFTokenizer):
+    raise TypeError(
+        f"SFT requires tokenizer_type='huggingface', got {type(tokenizer_model).__name__}"
+    )
+  raw_tokenizer = tokenizer_model.tokenizer
 
   data_processing_utils.validate_and_configure_sft_columns(
-      data_columns, tokenizer_model, getattr(config, "chat_template", None)
+      data_columns, raw_tokenizer, getattr(config, "chat_template", None)
   )
 
+  sentinel_ids = input_pipeline_utils.initialize_sentinel_tokens(raw_tokenizer)
   dataset = dataset.map(
-      functools.partial(_format_chat_template_grain, data_columns=data_columns, tokenizer_model=tokenizer_model)
-  )
-
-  if tokenize:
-    dataset = dataset.map(
-        functools.partial(
-            _tokenize_sft_chunks,
-            text_column_name=data_columns[0],
-            tokenizer_model=tokenizer_model,
-        )
-    )
-
-  dataset = dataset.map(
-      input_pipeline_utils.SFTPromptMasking(
-          text_column_name=data_columns[0],
-          completion_only=config.sft_train_on_completion_only,
+      functools.partial(
+          _format_and_mask_sft,
+          data_columns=data_columns,
+          tokenizer_model=raw_tokenizer,
+          sentinel_ids=sentinel_ids,
           max_target_length=config.max_target_length,
-          unk_id=pad_id,
+          pad_id=pad_id,
+          chat_template=getattr(config, "chat_template", None),
+          sft_train_last_turn_only=getattr(config, "sft_train_last_turn_only", False),
+          sft_train_on_thoughts_only=getattr(config, "sft_train_on_thoughts_only", False),
       )
   )
   data_columns = ("inputs", "targets")
 
+  # SFT HuggingFace pipelines require thread-safe main-thread tokenizer execution to prevent C++ GIL crashes.
+  # Native tokenizers (SentencePiece/TikToken) are thread-safe and can leverage multiple threads!
+  if getattr(config, "tokenizer_type", None) == "huggingface":
+    num_threads = 1
+    prefetch_buffer_size = 1
+  else:
+    num_threads = config.grain_num_threads
+    prefetch_buffer_size = config.grain_prefetch_buffer_size
+
+  dataset = dataset.to_iter_dataset(
+      read_options=grain.ReadOptions(
+          num_threads=num_threads,
+          prefetch_buffer_size=prefetch_buffer_size,
+      )
+  )
+
   batch_size = data_processing_utils.get_local_batch_size(config)
   dataset = data_processing_utils.format_and_batch(
-      dataset, config, batch_size, pad_id, data_columns, base_tokenizer_model
+      dataset, config, batch_size, pad_id, data_columns, tokenizer_model
   )
   dataset = data_processing_utils.apply_multiprocessing_and_prefetch(
       dataset, config, grain_worker_count, grain_per_worker_buffer_size

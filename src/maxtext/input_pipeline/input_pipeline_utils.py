@@ -12,32 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Operations used by Grain"""
+"""Input pipeline utilities for Grain, HuggingFace, and SFT masking transforms."""
+
+from __future__ import annotations
 
 import dataclasses
 import warnings
 from threading import current_thread
-from typing import Any, Iterable, TYPE_CHECKING
-
-from jinja2 import TemplateError
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
   import datasets
   import tensorflow as tf
+  import transformers
 
 import grain.python as grain
 import numpy as np
-from grain._src.python.dataset.sources.tfrecord_dataset import _TFRecordReader, _TFRecordDatasetIterator  # pylint: disable=protected-access
+from grain._src.python.dataset.sources.tfrecord_dataset import (_TFRecordDatasetIterator,  # pylint: disable=protected-access
+                                                                _TFRecordReader)
 from grain.experimental import TFRecordIterDataset
-from maxtext.input_pipeline.protos import example_pb2
+
 from maxtext.input_pipeline import tokenizer
+from maxtext.input_pipeline.protos import example_pb2
 from maxtext.multimodal import processor as mm_processor
 from maxtext.multimodal import utils as mm_utils
-from maxtext.utils import gcs_utils
-from maxtext.utils import max_logging
+from maxtext.utils import gcs_utils, max_logging
 
 Features = dict[str, Any]
 INPUT_TOKENS_KEY = "input_ids"
+
 
 ########## Functions used by TFDS pipeline
 
@@ -210,150 +213,6 @@ def extract_token_ids(tokens):
     raise ValueError(f"Can't extract token_ids from type {type(tokens)}")
 
 
-def verify_chat_template_generation_prompt_logic(tokenizer_model):
-  """Verifies the tokenizer's chat template for correct SFT loss masking.
-
-  This function ensures that the tokens added by `add_generation_prompt=True`
-  are identical to the tokens that begin an assistant's turn in a complete
-  conversation, which is critical for masking prompt tokens during SFT loss
-  calculation.
-
-  Example of a mismatch:
-    A `ValueError` is raised if the generation prompt and the actual
-    assistant prefix do not match. For example:
-
-    - `add_generation_prompt=True` on a user message produces a prompt ending in:
-      `...<|im_start|>generation\n`
-    - A full turn with an assistant message starts the reply with:
-      `...<|im_start|>assistant\n...`
-
-    This function would fail because the tokens for "generation" do not
-    match the tokens for "assistant".
-
-  Args:
-    tokenizer_model: The Hugging Face tokenizer instance to verify.
-
-  Raises:
-    ValueError: If the `add_generation_prompt` tokens do not exactly
-      match the beginning of an assistant message in the template.
-  """
-  dummy_msgs = [{"role": "system", "content": "System message"}, {"role": "user", "content": "Test message"}]
-
-  try:
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True)
-  except TemplateError:
-    max_logging.info(
-        "Tokenizer failed to apply chat template with 'system' role. "
-        "Falling back to 'user' role only for chat template verification."
-    )
-    dummy_msgs.pop(0)
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True)
-  prompt_wo_gen_ids = extract_token_ids(prompt_wo_gen_tokens)
-
-  prompt_w_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=True, tokenize=True)
-  prompt_w_gen_ids = extract_token_ids(prompt_w_gen_tokens)
-
-  if prompt_w_gen_ids[: len(prompt_wo_gen_ids)] != prompt_wo_gen_ids:
-    raise ValueError("Unable to extract generation prompt tokens.")
-  # Extract the tokenized generation prompt (the expected assistant prefix)
-  assistant_prefix = prompt_w_gen_ids[len(prompt_wo_gen_ids) :]
-  full_turn_tokens = extract_token_ids(
-      tokenizer_model.apply_chat_template(
-          dummy_msgs + [{"role": "assistant", "content": "Dummy response"}], add_generation_prompt=False, tokenize=True
-      )
-  )
-  full_turn_ids = extract_token_ids(full_turn_tokens)
-  # Extract the actual tokens that appear right after the user message in the full turn
-  actual_prefix_in_full_turn = full_turn_ids[len(prompt_wo_gen_ids) : len(prompt_wo_gen_ids) + len(assistant_prefix)]
-
-  if actual_prefix_in_full_turn != assistant_prefix:
-    expected_str = tokenizer_model.decode(assistant_prefix)
-    actual_str = tokenizer_model.decode(actual_prefix_in_full_turn)
-    raise ValueError(
-        "Chat template generation prompt mismatch!\n"
-        f"Expected assistant prefix tokens: {assistant_prefix} ('{expected_str}')\n"
-        f"Actual prefix tokens found: {actual_prefix_in_full_turn} ('{actual_str}')\n"
-        "This means the tokenizer's chat template will break the sft masking logic."
-    )
-
-
-def _get_completion_in_chat_template(tokenizer_model, round_msgs):
-  """
-  Calculates the completion part of a conversation turn when formatted with a chat template.
-
-  This function handles both older and current Hugging Face tokenizers. Modern tokenizers
-  may return a `BatchEncoding` object instead of a simple list of token IDs.
-
-  Args:
-    tokenizer_model: The tokenizer instance.
-    round_msgs: A list of messages for the current conversational turn, including the assistant's response.
-
-  Returns:
-    A string representing the completion formatted by the chat template.
-  """
-  prompt_completion_tokens = tokenizer_model.apply_chat_template(round_msgs, add_generation_prompt=False, tokenize=True)
-  # include generation_prompt as part of the prompt tokens
-  prompt_tokens = tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=True, tokenize=True)
-
-  prompt_completion_ids = extract_token_ids(prompt_completion_tokens)
-  prompt_ids = extract_token_ids(prompt_tokens)
-
-  completion_tokens = prompt_completion_ids[len(prompt_ids) :]
-  completion_in_chat_template = tokenizer_model.decode(completion_tokens, skip_special_tokens=False)
-  return completion_in_chat_template
-
-
-def apply_chat_template(example, tokenizer_model, data_column_name):
-  """Formats conversational data by applying the tokenizer's chat template
-  and identifying prompt/completion segments for SFT masking.
-
-  Args:
-    example: A dictionary containing conversational data. It is expected to have a key
-      specified by `data_column_name` that holds a list of messages.
-    tokenizer_model: The tokenizer instance associated with the language model,
-      which contains the specific chat template.
-    data_column_name: The name of the column in the `example` dictionary
-      that contains the list of messages.
-
-  Returns:
-    The modified `example` dictionary.
-      - The `data_column_name` column will be updated to a list of
-        messages, each formatted according to the tokenizer's chat template.
-      - A new column "is_prompt" is added, where `True` indicates the
-        tokens contain the system message, user message, and generation
-        prompt (if applicable). `False` indicates the expected LLM
-        completion, excluding the assistant's start tokens.
-  """
-  messages = []
-  is_prompt = []
-  round_msgs = []
-  try:
-    for idx, message in enumerate(example[data_column_name]):
-      if message["role"] == "system":
-        if idx != 0:
-          raise ValueError(f"System message found at index {idx}. System messages must be at index 0.")
-        round_msgs.append(message)
-      elif message["role"] == "user":
-        round_msgs.append(message)
-        prompt_in_chat_template = tokenizer_model.apply_chat_template(
-            round_msgs, add_generation_prompt=True, tokenize=False
-        )
-        messages.append(prompt_in_chat_template)
-        is_prompt.append(True)
-      elif message["role"] == "assistant":
-        round_msgs.append(message)
-        messages.append(_get_completion_in_chat_template(tokenizer_model, round_msgs))
-        is_prompt.append(False)
-        # Round ended, clearing the buffer.
-        round_msgs.clear()
-  except ValueError as e:
-    max_logging.log(f"Unable to apply chat template: {e}")
-    raise e
-  example["is_prompt"] = is_prompt
-  example[data_column_name] = messages
-  return example
-
-
 def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
   """Tokenize a HuggingFace dataset"""
   for column_name in column_names:
@@ -364,38 +223,6 @@ def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
     elif isinstance(example[column_name], str):
       example[column_name] = hf_tokenizer(example[column_name], truncation=truncation, max_length=max_length)["input_ids"]
   return example
-
-
-@dataclasses.dataclass
-class SFTPromptMasking(grain.MapTransform):
-  """Construct inputs and targets for SFT training. Concat prompt and completion to generate inputs.
-  For targets, if train on completion only, the prompt will be masked by unk_id. Otherwise the same as inputs.
-  """
-
-  def __init__(self, text_column_name, completion_only, max_target_length, unk_id=0):
-    self.text_column_name = text_column_name
-    self.completion_only = completion_only
-    self.max_target_length = max_target_length
-    self.unk_id = unk_id
-
-  def map(self, element):
-    """
-    Maps a single dataset element to an SFT training instance.
-    It concatenates the prompt and completion to form the `inputs` sequence.
-    For the `targets` sequence:
-    - If `self.completion_only` is `True`, the prompt portion of the
-      concatenated sequence is masked using `self.unk_id`.
-    - If `self.completion_only` is `False`, the target sequence is
-      identical to the input sequence.
-    """
-    inputs, targets = [], []
-    for i, text in enumerate(element[self.text_column_name]):
-      inputs += text
-      targets += [self.unk_id] * len(text) if self.completion_only and element["is_prompt"][i] else text
-    return {
-        "inputs": np.asarray(inputs[: self.max_target_length], dtype=np.int32),
-        "targets": np.asarray(targets[: self.max_target_length], dtype=np.int32),
-    }
 
 
 @dataclasses.dataclass
@@ -418,18 +245,329 @@ class SFTPromptMaskingVision(grain.MapTransform):
     }
 
 
+def _supports_assistant_tokens_mask(tokenizer_model: transformers.PreTrainedTokenizerBase) -> bool:
+  """Returns True iff the tokenizer's apply_chat_template supports return_assistant_tokens_mask."""
+  import inspect  # pylint: disable=import-outside-toplevel
+  if not hasattr(tokenizer_model, "apply_chat_template"):
+    return False
+  try:
+    sig = inspect.signature(tokenizer_model.apply_chat_template)
+    return "return_assistant_tokens_mask" in sig.parameters
+  except (ValueError, TypeError):
+    return False
+
+
+_START_SENTINEL_STR = "<|sft_train_start|>"
+_END_SENTINEL_STR   = "<|sft_train_end|>"
+_SENTINEL_TOKENS = [_START_SENTINEL_STR, _END_SENTINEL_STR]
+
+
+def _inject_sentinels_into_content(
+    content: str | list[dict[str, Any]]
+) -> str | list[dict[str, Any]]:
+  """Wraps assistant message content with SFT sentinel markers.
+
+  For string content: prepends START and appends END to the whole string.
+  For list content (multimodal): inserts START at the start of the first
+  text block and END at the end of the last text block, leaving non-text
+  blocks (images etc.) untouched.
+
+  Raises ValueError if list content contains no text blocks (nothing to mask).
+  """
+  if isinstance(content, str):
+    return f"{_START_SENTINEL_STR}{content}{_END_SENTINEL_STR}"
+  if not isinstance(content, list):
+    raise TypeError(f"Unexpected content type {type(content)!r}; expected str or list.")
+  text_block_indices = [i for i, b in enumerate(content) if b.get("type") == "text"]
+  if not text_block_indices:
+    raise ValueError("Assistant message has list content with no text blocks; cannot inject sentinels.")
+  result = [dict(b) for b in content]
+  first, last = text_block_indices[0], text_block_indices[-1]
+  result[first]["text"] = _START_SENTINEL_STR + result[first]["text"]
+  result[last]["text"] = result[last]["text"] + _END_SENTINEL_STR
+  return result
+
+
+def initialize_sentinel_tokens(tokenizer_model: transformers.PreTrainedTokenizerBase) -> tuple[int, int]:
+  """Adds sentinel special tokens to the tokenizer and returns their IDs.
+
+  Must be called once at pipeline setup time. The returned IDs are used by
+  `apply_chat_template` to locate trainable regions in the token stream.
+  The tokenizer's vocabulary is mutated; these IDs must never reach the model.
+  """
+  tokenizer_model.add_special_tokens({"additional_special_tokens": _SENTINEL_TOKENS})
+  start_id = tokenizer_model.convert_tokens_to_ids(_START_SENTINEL_STR)
+  end_id = tokenizer_model.convert_tokens_to_ids(_END_SENTINEL_STR)
+  if start_id == tokenizer_model.unk_token_id:
+    raise ValueError(
+        f"Sentinel {_START_SENTINEL_STR!r} resolved to unk_token_id={tokenizer_model.unk_token_id}; "
+        "token was not added correctly."
+    )
+  return start_id, end_id
+
+
+# pylint: disable=too-many-positional-arguments
+def apply_chat_template(
+    example: dict[str, Any],
+    tokenizer_model: transformers.PreTrainedTokenizerBase,
+    data_column_name: str,
+    sentinel_ids: tuple[int, int],
+    max_target_length: int,
+    unk_id: int = 0,
+    chat_template: str | None = None,
+    sft_train_last_turn_only: bool = False,
+    sft_train_on_thoughts_only: bool = False,
+    **kwargs: Any,
+) -> dict[str, Any]:
+  """Formats a conversation and creates SFT loss targets via sentinel-based masking.
+
+  Injects sentinel markers around assistant content in text space, renders the
+  conversation through the chat template, tokenizes as a single string, then
+  strips sentinel tokens to produce aligned inputs/targets arrays.
+
+  Args:
+      example: Dataset element with a list of {role, content} messages.
+      tokenizer_model: HuggingFace tokenizer. Must have sentinel IDs already added
+          via `initialize_sentinel_tokens`.
+      data_column_name: Key in example holding the message list.
+      sentinel_ids: (start_id, end_id) returned by `initialize_sentinel_tokens`.
+      max_target_length: Max length for inputs and targets arrays.
+      unk_id: Token ID used to represent masked (non-trainable) positions in targets.
+      chat_template: Optional Jinja chat template override string.
+      sft_train_last_turn_only: If True, only trains on the final assistant turn in the sequence.
+      sft_train_on_thoughts_only: If True, only trains on the reasoning/thinking blocks.
+
+  Returns:
+      Dict with 'inputs' (np.int32), 'targets' (np.int32, prompt positions filled
+      with unk_id), segmentation, and position arrays.
+  """
+  if chat_template == "":
+    chat_template = None
+  raw_messages: list[dict[str, Any]] = example[data_column_name]
+  start_sentinel_id, end_sentinel_id = sentinel_ids
+
+  # Native HF assistant token masking does not support advanced turn or reasoning masking.
+  # If any advanced masking option is active, we bypass native masking.
+  if not sft_train_last_turn_only and not sft_train_on_thoughts_only and _supports_assistant_tokens_mask(tokenizer_model):
+    try:
+      result = tokenizer_model.apply_chat_template(
+          raw_messages,
+          tokenize=True,
+          return_assistant_tokens_mask=True,
+          return_dict=True,
+          chat_template=chat_template,
+      )
+      input_ids = np.asarray(result["input_ids"], dtype=np.int32)
+      asst_mask = np.asarray(result["assistant_masks"], dtype=bool)
+      if np.any(asst_mask):
+        targets      = np.where(asst_mask, input_ids, np.int32(unk_id))
+        inputs_slice = input_ids[:max_target_length]
+        targets_slice = targets[:max_target_length]
+        asst_mask_slice = asst_mask[:max_target_length]
+        ret = {
+            "inputs": inputs_slice,
+            "targets": targets_slice,
+            "inputs_segmentation": np.ones(len(inputs_slice), dtype=np.int32),
+            "targets_segmentation": np.where(asst_mask_slice, np.int32(1), np.int32(0)),
+            "inputs_position": np.arange(len(inputs_slice), dtype=np.int32),
+            "targets_position": np.arange(len(targets_slice), dtype=np.int32),
+        }
+        if "images" in example:
+          ret["images"] = example["images"]
+        return ret
+    except Exception as exc:  # pylint: disable=broad-except
+      max_logging.log(
+          f"Native assistant_tokens_mask failed ({type(exc).__name__}: {exc}); "
+          "falling back to sentinel-based masking."
+      )
+
+  tagged_messages = []
+  last_asst_idx = -1
+  for idx, msg in enumerate(raw_messages):
+    if msg["role"] == "assistant":
+      last_asst_idx = idx
+
+  for idx, msg in enumerate(raw_messages):
+    tagged = dict(msg)
+    if msg["role"] == "assistant":
+      if sft_train_last_turn_only and idx != last_asst_idx:
+        # Keep prior assistant turns completely sentinel-free (so they are masked out)
+        pass
+      else:
+        if sft_train_on_thoughts_only:
+          if "reasoning_content" in msg and msg["reasoning_content"]:
+            # Wrap ONLY the reasoning content chunk inside boundaries
+            tagged["reasoning_content"] = f"{_START_SENTINEL_STR}{msg['reasoning_content']}{_END_SENTINEL_STR}"
+          elif "</think>" in msg["content"]:
+            # Support inline split-thought masking (e.g. Qwen3/Deepseek style)
+            content = msg["content"]
+            parts = content.split("</think>", 1)
+            if "<think>" in parts[0]:
+              think_parts = parts[0].split("<think>", 1)
+              tagged_content = f"<think>{_START_SENTINEL_STR}{think_parts[1]}</think>{_END_SENTINEL_STR}{parts[1]}"
+            else:
+              tagged_content = f"{_START_SENTINEL_STR}{parts[0]}</think>{_END_SENTINEL_STR}{parts[1]}"
+            tagged["content"] = tagged_content
+          else:
+            pass
+        else:
+          if "reasoning_content" in msg and msg["reasoning_content"]:
+            tagged["reasoning_content"] = f"{_START_SENTINEL_STR}{msg['reasoning_content']}"
+            tagged["content"] = f"{msg['content']}{_END_SENTINEL_STR}"
+          else:
+            tagged["content"] = _inject_sentinels_into_content(msg["content"])
+    tagged_messages.append(tagged)
+
+  if hasattr(tokenizer_model, "apply_chat_template"):
+    rendered_str = tokenizer_model.apply_chat_template(
+        tagged_messages,
+        add_generation_prompt=False,
+        tokenize=False,
+        chat_template=chat_template,
+        **kwargs,
+    )
+  else:
+    if chat_template is None:
+      wrapper_type = type(tokenizer_model).__name__
+      raise TypeError(
+          "apply_chat_template expects a Hugging Face tokenizer supporting the "
+          "'apply_chat_template' method, but received a tokenizer model of "
+          f"type '{wrapper_type}' without a custom 'chat_template'.\n\nTo "
+          "format conversational/chat datasets on a native binary tokenizer, you must "
+          "explicitly provide a custom chat template file (e.g. setting "
+          "'chat_template_path')."
+      )
+    
+    from jinja2 import Environment  # pylint: disable=import-outside-toplevel
+    env = Environment()
+    
+    bos_token = ""
+    eos_token = ""
+    if hasattr(tokenizer_model, "bos_id") and tokenizer_model.bos_id is not None:
+      try:
+        bos_token = tokenizer_model.decode([tokenizer_model.bos_id])
+      except Exception:
+        pass
+    if hasattr(tokenizer_model, "eos_id") and tokenizer_model.eos_id is not None:
+      try:
+        eos_token = tokenizer_model.decode([tokenizer_model.eos_id])
+      except Exception:
+        pass
+        
+    try:
+      template_obj = env.from_string(chat_template)
+      rendered_str = template_obj.render(
+          messages=tagged_messages,
+          bos_token=bos_token,
+          eos_token=eos_token,
+          add_generation_prompt=False,
+          **kwargs
+      )
+    except Exception as e:
+      raise ValueError(f"Failed to functionally render custom Jinja chat template: {e}") from e
+
+  if callable(tokenizer_model):
+    tokenized = tokenizer_model(rendered_str, add_special_tokens=False)
+  else:
+    tokenized = tokenizer_model.encode(rendered_str)
+
+  token_ids: list[int] = extract_token_ids(tokenized)
+
+  clean_inputs: list[int] = []
+  clean_targets: list[int] = []
+  in_assistant_turn = False
+  for token_id in token_ids:
+    if token_id == start_sentinel_id:
+      if in_assistant_turn:
+        raise ValueError("Nested START sentinel detected; check message content for accidental sentinel strings.")
+      in_assistant_turn = True
+      continue
+    if token_id == end_sentinel_id:
+      if not in_assistant_turn:
+        raise ValueError("END sentinel without matching START; token stream is corrupted.")
+      in_assistant_turn = False
+      continue
+    clean_inputs.append(token_id)
+    clean_targets.append(token_id if in_assistant_turn else unk_id)
+
+  if in_assistant_turn:
+    raise ValueError("START sentinel without matching END; assistant turn is not closed.")
+
+  inputs_arr = np.asarray(clean_inputs[:max_target_length],  dtype=np.int32)
+  targets_arr = np.asarray(clean_targets[:max_target_length], dtype=np.int32)
+  ret = {
+      "inputs": inputs_arr,
+      "targets": targets_arr,
+      "inputs_segmentation": np.ones(len(inputs_arr), dtype=np.int32),
+      "targets_segmentation": np.where(targets_arr != unk_id, np.int32(1), np.int32(0)),
+      "inputs_position": np.arange(len(inputs_arr), dtype=np.int32),
+      "targets_position": np.arange(len(targets_arr), dtype=np.int32),
+  }
+  if "images" in example:
+    ret["images"] = example["images"]
+  return ret
+
+
 @dataclasses.dataclass
-class HFNormalizeFeatures(grain.MapTransform):
-  """Normalize feature keys for HuggingFace input"""
+class SFTPromptMasking(grain.MapTransform):
+  """Single-pass SFT prompt masking as a Grain MapTransform for HuggingFace pipelines.
 
-  def __init__(self, column_name):
-    self.column_name = column_name
+  Delegates to `apply_chat_template` for each element. The tokenizer must
+  have sentinel IDs already registered via `initialize_sentinel_tokens`.
 
-  def map(self, element):
-    return {
-        "inputs": np.asarray(element[self.column_name], dtype=np.int32),
-        "targets": np.asarray(element[self.column_name], dtype=np.int32),
-    }
+  Args:
+      tokenizer_model: HuggingFace tokenizer with sentinel tokens already added.
+      data_column_name: Key in each element holding the list of message dicts.
+      sentinel_ids: `(start_id, end_id)` tuple returned by `initialize_sentinel_tokens`.
+      max_target_length: Maximum sequence length for inputs and targets arrays.
+      pad_id: Token ID used for masked (non-trainable) positions in targets.
+      chat_template: Optional Jinja chat template override string.
+      sft_train_last_turn_only: If True, only the final assistant turn carries loss.
+      sft_train_on_thoughts_only: If True, only reasoning/thinking blocks carry loss.
+      **kwargs: Extra keyword arguments forwarded to `apply_chat_template`.
+  """
+
+  # pylint: disable=too-many-positional-arguments
+  def __init__(
+      self,
+      tokenizer_model: transformers.PreTrainedTokenizerBase,
+      data_column_name: str,
+      sentinel_ids: tuple[int, int],
+      max_target_length: int,
+      pad_id: int,
+      chat_template: str | None = None,
+      sft_train_last_turn_only: bool = False,
+      sft_train_on_thoughts_only: bool = False,
+      **kwargs: Any,
+  ) -> None:
+    self.tokenizer_model = tokenizer_model
+    self.data_column_name = data_column_name
+    self.sentinel_ids = sentinel_ids
+    self.max_target_length = max_target_length
+    self.pad_id = pad_id
+    self.chat_template = chat_template
+    self.sft_train_last_turn_only = sft_train_last_turn_only
+    self.sft_train_on_thoughts_only = sft_train_on_thoughts_only
+    self.kwargs = kwargs
+
+  def map(self, element: dict[str, Any]) -> dict[str, Any]:
+    res = apply_chat_template(
+        example=element,
+        tokenizer_model=self.tokenizer_model,
+        data_column_name=self.data_column_name,
+        sentinel_ids=self.sentinel_ids,
+        max_target_length=self.max_target_length,
+        unk_id=self.pad_id,
+        chat_template=self.chat_template,
+        sft_train_last_turn_only=self.sft_train_last_turn_only,
+        sft_train_on_thoughts_only=self.sft_train_on_thoughts_only,
+        **self.kwargs,
+    )
+    filtered = {k: res[k] for k in ("inputs", "targets") if k in res}
+    if "images" in res:
+      filtered["images"] = res["images"]
+    return filtered
+
 
 
 class HFDataSource(grain.RandomAccessDataSource):
@@ -803,7 +941,12 @@ class PadOrTrimToMaxLength(grain.MapTransform):
     """map to each element"""
     data_columns = list(element.keys())
     for data_column in data_columns:
-      if data_column != "images":
+      if (
+          data_column != "images"
+          and not data_column.endswith("_position")
+          and not data_column.endswith("_segmentation")
+          and not data_column.endswith("_true_length")
+      ):
         if isinstance(element[data_column], mm_utils.PreprocessorOutput):
           raise TypeError("Only 'images' column can be of type PreprocessorOutput.")
 

@@ -1258,6 +1258,12 @@ class FineTuning(BaseModel):
   sft_train_on_completion_only: bool = Field(
       False, description="If True, trains only on the completion part of the text."
   )
+  sft_train_last_turn_only: bool = Field(
+      False, description="If True, SFT only trains on the final assistant turn in the sequence."
+  )
+  sft_train_on_thoughts_only: bool = Field(
+      False, description="If True, SFT only trains on reasoning/thinking blocks."
+  )
   formatting_func_path: str = Field(
       "",
       description="Path to the custom data formatting function for SFT.",

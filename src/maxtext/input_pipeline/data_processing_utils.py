@@ -14,18 +14,30 @@
 
 """Utility functions for data processing pipelines."""
 
+from __future__ import annotations
+
 import functools
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-import jax
-from grain.experimental import BestFitPackIterDataset, pick_performance_config
+if TYPE_CHECKING:
+  import transformers
+
 import grain.python as grain
+import jax
+import ml_collections
+from grain.experimental import BestFitPackIterDataset, pick_performance_config
 
-from maxtext.input_pipeline import input_pipeline_utils
-from maxtext.input_pipeline import tokenizer
+from maxtext.input_pipeline import input_pipeline_utils, tokenizer
 from maxtext.utils import elastic_utils
 
 
-def parse_and_keep_features(dataset, config, data_columns, tokenize):
+def parse_and_keep_features(
+    dataset: grain.MapDataset,
+    config: ml_collections.ConfigDict,
+    data_columns: Sequence[str],
+    tokenize: bool,
+) -> grain.MapDataset:
   """Parse arrayrecord features or keep specified columns for other formats."""
   if config.grain_file_type in ("arrayrecord", "tfrecord"):
     dataset = dataset.map(input_pipeline_utils.ParseFeatures(data_columns, tokenize))
@@ -35,7 +47,7 @@ def parse_and_keep_features(dataset, config, data_columns, tokenize):
   return dataset
 
 
-def get_tokenizer_and_pad_id(config):
+def get_tokenizer_and_pad_id(config: ml_collections.ConfigDict) -> tuple[tokenizer.WrappedTokenizer, int]:
   """Builds tokenizer and extracts pad_id safely."""
   tokenizer_model = tokenizer.build_tokenizer(
       config.tokenizer_path,
@@ -53,18 +65,23 @@ def get_tokenizer_and_pad_id(config):
   return tokenizer_model, pad_id
 
 
-def validate_and_configure_sft_columns(data_columns, tokenizer_model, chat_template=None):
+def validate_and_configure_sft_columns(
+    data_columns: Sequence[str],
+    tokenizer_model: transformers.PreTrainedTokenizerBase,
+    chat_template: str | None = None,
+) -> None:
   """Validates SFT data columns and configures the tokenizer chat template."""
   if chat_template and hasattr(tokenizer_model, "chat_template"):
     tokenizer_model.chat_template = chat_template
 
   supported_columns = [["prompt", "completion"], ["messages"], ["question", "answer"]]
-  assert any(
-      set(data_columns) == set(supported) for supported in supported_columns
-  ), f"Dataset column names mismatch. Expected columns to match one of {supported_columns}, but got {data_columns}"
+  if not any(set(data_columns) == set(supported) for supported in supported_columns):
+    raise ValueError(
+        f"Dataset column names mismatch. Expected columns to match one of {supported_columns}, but got {data_columns}"
+    )
 
 
-def get_local_batch_size(config):
+def get_local_batch_size(config: ml_collections.ConfigDict) -> int:
   """Computes local batch size based on process count and expansion factor."""
   if config.elastic_enabled:
     batch_size = elastic_utils.get_local_batch_size(config)
@@ -78,7 +95,15 @@ def get_local_batch_size(config):
   return batch_size
 
 
-def format_and_batch(dataset, config, batch_size, pad_id, data_columns, tokenizer_model, shift=True):
+def format_and_batch(
+    dataset: grain.MapDataset | grain.IterDataset,
+    config: ml_collections.ConfigDict,
+    batch_size: int,
+    pad_id: int,
+    data_columns: Sequence[str],
+    tokenizer_model: tokenizer.WrappedTokenizer,
+    shift: bool = True,
+) -> grain.MapDataset | grain.IterDataset:
   """Packs or pads the dataset, batches it, and optionally shifts tokens for next-token prediction.
 
   When `config.grain_use_elastic_iterator` is True, batching is skipped
@@ -138,11 +163,18 @@ def format_and_batch(dataset, config, batch_size, pad_id, data_columns, tokenize
   return dataset
 
 
-def apply_multiprocessing_and_prefetch(dataset, config, grain_worker_count, grain_per_worker_buffer_size):
+def apply_multiprocessing_and_prefetch(
+    dataset: grain.MapDataset | grain.IterDataset,
+    config: ml_collections.ConfigDict,
+    grain_worker_count: int,
+    grain_per_worker_buffer_size: int,
+) -> grain.MapDataset | grain.IterDataset:
   """Applies multiprocessing and prefetching configurations to the dataset."""
-  if config.grain_use_elastic_iterator:
-    # ElasticIterator applies multiprocessing itself.
+  if config.grain_use_elastic_iterator or grain_worker_count == 0:
+    # ElasticIterator or zero-worker mode bypasses background multiprocessing prefetch.
     return dataset
+  if hasattr(dataset, "to_iter_dataset"):
+    dataset = dataset.to_iter_dataset()
   multiprocessing_options = (
       pick_performance_config(
           ds=dataset,

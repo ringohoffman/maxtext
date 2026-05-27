@@ -14,13 +14,15 @@
 
 """Provides op for tokenizing a dataset."""
 
-from typing import Literal, Sequence, Collection
 from pathlib import Path
-from maxtext.utils import max_logging
-import transformers
+from typing import Collection, Literal, Sequence, TypeAlias
+
 import tiktoken
-from tiktoken.load import load_tiktoken_bpe
+import transformers
 from sentencepiece import SentencePieceProcessor
+from tiktoken.load import load_tiktoken_bpe
+
+from maxtext.utils import max_logging
 
 
 class TikTokenTokenizer:
@@ -217,7 +219,14 @@ class SentencePieceTokenizer:
 
 class HFTokenizer:
   """
-  Tokenizing using huggingface tokenizer
+  Tokenizing using huggingface tokenizer.
+
+  Wraps a HuggingFace ``PreTrainedTokenizer`` and exposes the common
+  MaxText tokenizer interface (``encode``, ``decode``, ``pad_id``, etc.).
+
+  HF-specific operations used by SFT pipelines (``apply_chat_template``,
+  ``add_special_tokens``, ``convert_tokens_to_ids``, ``chat_template``) are
+  delegated to the underlying tokenizer so callers never need to unwrap.
   """
 
   def __init__(self, model_path: str, add_bos: bool, add_eos: bool, hf_access_token: str):
@@ -240,11 +249,23 @@ class HFTokenizer:
     return self.tokenizer.decode(t)
 
 
-def build_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token):
+# What build_tokenizer() returns — MaxText wrapper types with a consistent
+# encode/decode/pad_id/bos_id/eos_id interface.
+WrappedTokenizer: TypeAlias = HFTokenizer | TikTokenTokenizer | SentencePieceTokenizer
+
+
+def build_tokenizer(
+  tokenizer_path: str,
+  tokenizer_type: Literal["tiktoken", "huggingface", "sentencepiece"],
+  add_bos: bool,
+  add_eos: bool,
+  hf_access_token: str,
+) -> 'WrappedTokenizer':
   """Loads the tokenizer at `tokenizer_path`"""
   max_logging.log(f"Tokenizer path: {tokenizer_path}")
   if tokenizer_type == "tiktoken":
-    assert "tiktoken" in tokenizer_path, f"Invalid tokenizer type: {tokenizer_type} chosen for {tokenizer_path}"
+    if "tiktoken" not in tokenizer_path:
+      raise ValueError(f"Invalid tokenizer type: {tokenizer_type} chosen for {tokenizer_path}")
     return TikTokenTokenizer(tokenizer_path, add_bos, add_eos)
   elif tokenizer_type == "huggingface":
     return HFTokenizer(tokenizer_path, add_bos, add_eos, hf_access_token)

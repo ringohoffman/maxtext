@@ -18,6 +18,8 @@ use_sft: true
 use_tunix_gradient_accumulation: true
 # sft_train_on_completion_only=false trains on both prompt and completion tokens; trains only on completion tokens otherwise
 sft_train_on_completion_only: true
+sft_train_last_turn_only: false
+sft_train_on_thoughts_only: false
 packing: true
 learning_rate: 2.e-5
 

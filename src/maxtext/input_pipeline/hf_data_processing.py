@@ -14,7 +14,7 @@
 
 """Input pipeline using Huggingface datasets."""
 
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 import ml_collections
 
@@ -193,39 +193,39 @@ def vision_sft_preprocessing_pipeline(
 
 
 def preprocessing_pipeline(
-    dataloading_host_index,
-    dataloading_host_count,
-    global_mesh,
-    dataset,
-    config,
-    data_column_names,
-    tokenize,
-    tokenizer_path,
-    hf_access_token,
-    global_batch_size,
-    max_target_length,
-    shuffle,
-    data_shuffle_seed,
-    chat_template_path="",
-    add_bos=True,
-    add_eos=True,
-    packing=True,
-    shift=True,
-    num_threads=1,
-    drop_remainder=True,
-    generate_padding_batch=False,
-    use_dpo=False,
-    use_sft=None,
-    use_tunix_gradient_accumulation=False,
-    num_microbatches=1,
-    sft_train_on_completion_only=True,
-    grain_worker_count=1,  # only support 0 or 1
-    max_segments_per_seq=None,
-    num_epoch=1,
+    dataloading_host_index: int,
+    dataloading_host_count: int,
+    global_mesh: jax.sharding.Mesh,
+    dataset: Any,
+    config: ml_collections.ConfigDict,
+    data_column_names: Sequence[str],
+    tokenize: bool,
+    tokenizer_path: str,
+    hf_access_token: str | None,
+    global_batch_size: int,
+    max_target_length: int,
+    shuffle: bool,
+    data_shuffle_seed: int,
+    chat_template_path: str = "",
+    add_bos: bool = True,
+    add_eos: bool = True,
+    packing: bool = True,
+    shift: bool = True,
+    num_threads: int = 1,
+    drop_remainder: bool = True,
+    generate_padding_batch: bool = False,
+    use_dpo: bool = False,
+    use_sft: bool | None = None,
+    use_tunix_gradient_accumulation: bool = False,
+    num_microbatches: int = 1,
+    sft_train_on_completion_only: bool = True,  # pylint: disable=unused-argument
+    grain_worker_count: int = 1,  # only support 0 or 1
+    max_segments_per_seq: int | None = None,
+    num_epoch: int = 1,
     chat_template: Optional[str] = None,
     formatting_func_path: Optional[str] = None,
     formatting_func_kwargs: Optional[dict] = None,
-):
+) -> Any:
   """pipeline for preprocessing HF dataset"""
   import datasets  # pylint: disable=import-outside-toplevel
 
@@ -292,10 +292,9 @@ def preprocessing_pipeline(
       )
 
     data_column_names = list(dataset.features.keys())
-    dataset = dataset.map(
-        input_pipeline_utils.apply_chat_template,
-        fn_kwargs={"tokenizer_model": tokenizer, "data_column_name": data_column_names[0]},
-    )
+
+    if use_sft:
+      tokenize = False
 
   pad_id = _get_pad_id(tokenizer)
 
@@ -321,20 +320,23 @@ def preprocessing_pipeline(
   )
   operations = []
   if use_sft:
-    input_pipeline_utils.verify_chat_template_generation_prompt_logic(tokenizer)
+    sentinel_ids = input_pipeline_utils.initialize_sentinel_tokens(tokenizer)
     operations.append(
         input_pipeline_utils.SFTPromptMasking(
-            text_column_name=data_column_names[0],
-            completion_only=sft_train_on_completion_only,
+            tokenizer_model=tokenizer,
+            data_column_name=data_column_names[0],
+            sentinel_ids=sentinel_ids,
             max_target_length=max_target_length,
-            unk_id=pad_id,
+            pad_id=pad_id,
+            chat_template=chat_template,
+            sft_train_last_turn_only=getattr(config, "sft_train_last_turn_only", False),
+            sft_train_on_thoughts_only=getattr(config, "sft_train_on_thoughts_only", False),
         )
     )
     data_column_names = ("inputs", "targets")
   elif not use_dpo:
     assert len(data_column_names) == 1
-    operations.append(input_pipeline_utils.HFNormalizeFeatures(data_column_names[0]))
-    data_column_names = ("inputs", "targets")
+    raise ValueError("Standard non-DPO/non-SFT text dataloading is not supported without SFT chat masking.")
 
   if packing:
     length_struct = {col: max_target_length for col in data_column_names}

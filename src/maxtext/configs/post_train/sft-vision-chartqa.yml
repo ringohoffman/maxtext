@@ -19,6 +19,8 @@ use_tunix_gradient_accumulation: true
 use_multimodal: true
 # For vision, the prompt contains image, we only train on completion tokens
 sft_train_on_completion_only: true
+sft_train_last_turn_only: false
+sft_train_on_thoughts_only: false
 packing: false  # packing is not supported yet
 freeze_vision_encoder_params: true
 learning_rate: 2.e-5

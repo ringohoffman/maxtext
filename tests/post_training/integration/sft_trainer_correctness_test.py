@@ -83,26 +83,23 @@ def prepare_maxtext_inputs(maxtext_data, config):
       add_eos_token=False,
       model_max_length=config.max_target_length,
   )
-  data = input_pipeline_utils.apply_chat_template(maxtext_data, tokenizer, "messages")
-  tokenized_data = input_pipeline_utils.tokenization(
-      data,
-      hf_tokenizer=tokenizer,
-      truncation=False,
-      max_length=config.max_target_length,
-      column_names=["messages"],
-  )
-  masked_inputs = input_pipeline_utils.SFTPromptMasking(
-      text_column_name="messages",
-      completion_only=False,
+  sentinel_ids = input_pipeline_utils.initialize_sentinel_tokens(tokenizer)
+  pad_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 0
+
+  formatted = input_pipeline_utils.apply_chat_template(
+      example=maxtext_data,
+      tokenizer_model=tokenizer,
+      data_column_name="messages",
+      sentinel_ids=sentinel_ids,
       max_target_length=config.max_target_length,
-      unk_id=tokenizer.unk_token_id,
-  ).map(tokenized_data)
+      unk_id=pad_id,
+  )
 
   global_batch_size = int(jax.device_count() * config.per_device_batch_size * config.gradient_accumulation_steps)
-  inputs = jnp.stack([np.asarray(masked_inputs["inputs"], dtype=np.int32) for _ in range(global_batch_size)])
-  inputs_segmentation = jnp.stack([(masked_inputs["inputs"] != 0).astype(np.int32) for _ in range(global_batch_size)])
+  inputs = jnp.stack([np.asarray(formatted["inputs"], dtype=np.int32) for _ in range(global_batch_size)])
+  inputs_segmentation = jnp.stack([np.asarray(formatted["inputs_segmentation"], dtype=np.int32) for _ in range(global_batch_size)])
   inputs_position = jnp.stack(
-      [np.arange(masked_inputs["inputs"].shape[0], dtype=np.int32) for _ in range(global_batch_size)]
+      [np.arange(formatted["inputs"].shape[0], dtype=np.int32) for _ in range(global_batch_size)]
   )
 
   return {

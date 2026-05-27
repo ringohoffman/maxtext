@@ -19,6 +19,8 @@ base_config: "post_train/distillation.yml"
 
 use_sft: true
 sft_train_on_completion_only: true
+sft_train_last_turn_only: false
+sft_train_on_thoughts_only: false
 
 # --- Dataset & Tokenizer ---
 hf_path: "HuggingFaceH4/ultrachat_200k"

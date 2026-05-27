@@ -14,12 +14,14 @@
 
 """Tokenize Op used by Grain"""
 
-from collections.abc import Sequence
 import dataclasses
 import threading
+from collections.abc import Sequence
 from typing import Any
+
 import grain.python as grain
 import numpy as np
+
 from maxtext.input_pipeline import tokenizer
 
 
@@ -30,7 +32,7 @@ class TokenizerTransformBase:
   # pylint: disable=attribute-defined-outside-init
   feature_names: str | Sequence[str]
   sequence_length: int | Sequence[int]
-  tokenizer: tokenizer.SentencePieceTokenizer | tokenizer.HFTokenizer | tokenizer.TikTokenTokenizer
+  tokenizer: tokenizer.WrappedTokenizer
 
   def __post_init__(self):
     self._processor = None
